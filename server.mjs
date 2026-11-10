@@ -44,16 +44,61 @@ function storedHistory(items) {
  while(history.length && JSON.stringify({history}).length>950) history=history.slice(2);
  return history;
 }
-async function askGemini(text, history=[]) {
+function isSearchIntent(text) {
+ return /\b(latest|today|current|news|weather|price|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|в интернете|погугл/i.test(text);
+}
+async function searchWeb(query, timeoutMs, metrics={}) {
+ const key = process.env.SERPER_API_KEY;
+ metrics.serperHttp = null;
+ metrics.serperOrganicCount = 0;
+ metrics.serperAnswerBox = false;
+ metrics.serperOutcome = 'pending';
+ if (!key) { metrics.serperOutcome = 'no_api_key'; return ''; }
+ if (timeoutMs < 150) { metrics.serperOutcome = 'budget_too_small'; return ''; }
+ const controller = new AbortController();
+ const timer = setTimeout(() => controller.abort(), timeoutMs);
+ try {
+  const response = await fetch('https://google.serper.dev/search', {
+   method: 'POST',
+   headers: { 'X-API-KEY': key, 'Content-Type': 'application/json' },
+   body: JSON.stringify({ q: query, gl: 'ru', hl: 'ru', num: 3 }),
+   signal: controller.signal
+  });
+  metrics.serperHttp = response.status;
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+   metrics.serperOutcome = 'http_error';
+   return '';
+  }
+  const organic = Array.isArray(data.organic) ? data.organic : [];
+  metrics.serperOrganicCount = organic.length;
+  const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+  metrics.serperAnswerBox = Boolean(answerBox);
+  const results = organic
+   .slice(0, 3)
+   .map((item, i) => `${i + 1}. ${String(item.title || '').slice(0, 160)}: ${String(item.snippet || '').slice(0, 300)} ${String(item.link || '').slice(0, 200)}`);
+  if (answerBox) results.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 300)}`);
+  const context = results.join('\n').slice(0, 1800);
+  metrics.serperOutcome = context ? 'results' : 'no_results';
+  return context;
+ } catch (e) {
+  metrics.serperOutcome = e.name === 'AbortError' ? 'timeout' : 'network_error';
+  return '';
+ } finally {
+  clearTimeout(timer);
+ }
+}
+async function askGemini(text, history=[], searchContext='', timeoutMs=3000, metrics={}) {
  const apiKey = envApiKey || config.apiKey;
  if (!apiKey) throw new Error('Добавьте API-ключ Gemini в .env или в настройках.');
- const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 3000);
+ const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), timeoutMs); const geminiStarted=Date.now();
  try {
-  const contents=[...history.map((item)=>({role:item.role,parts:[{text:item.text}]})),{role:'user',parts:[{text}]}];
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`, { method:'POST', headers:{'content-type':'application/json','x-goog-api-key':apiKey}, body:JSON.stringify({ systemInstruction:{parts:[{text:config.systemPrompt}]}, contents, generationConfig:{temperature:0.5,maxOutputTokens:64,...(config.model.startsWith('gemini-3')?{thinkingConfig:{thinkingLevel:'minimal'}}:{})} }), signal:controller.signal });
-  const data = await response.json(); if (!response.ok) throw new Error(data.error?.message || `Gemini вернул HTTP ${response.status}`);
+  const userText=searchContext?`${text}\n\nРезультаты поиска:\n${searchContext}\nИспользуй их, если они относятся к вопросу. Не утверждай, что у тебя нет доступа к интернету.`:text;
+  const contents=[...history.map((item)=>({role:item.role,parts:[{text:item.text}]})),{role:'user',parts:[{text:userText}]}];
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(config.model)}:generateContent`, { method:'POST', headers:{'content-type':'application/json','x-goog-api-key':apiKey}, body:JSON.stringify({ systemInstruction:{parts:[{text:config.systemPrompt}]}, contents, generationConfig:{temperature:0.5,maxOutputTokens:256,...(config.model.startsWith('gemini-3')?{thinkingConfig:{thinkingLevel:'minimal'}}:{})} }), signal:controller.signal });
+  const data = await response.json(); metrics.geminiHttp=response.status; metrics.finishReason=data.candidates?.[0]?.finishReason ?? 'missing'; metrics.outputTokens=data.usageMetadata?.candidatesTokenCount ?? null; if (!response.ok) throw new Error(data.error?.message || `Gemini вернул HTTP ${response.status}`);
   return data.candidates?.[0]?.content?.parts?.map(p=>p.text||'').join('').trim() || 'Не получилось сформулировать ответ. Спроси ещё раз.';
- } finally { clearTimeout(timer); }
+ } finally { metrics.geminiMs=Date.now()-geminiStarted; clearTimeout(timer); }
 }
 const server = http.createServer(async (req,res) => {
  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -62,7 +107,7 @@ const server = http.createServer(async (req,res) => {
  if (isPublicTunnelRequest) { const entry={time:new Date().toISOString(),question:`${req.method} ${url.pathname}`,answer:'Публичный запрос дошёл до сервера',ok:true}; log.unshift(entry); log.splice(50); }
  if ((!isLocalRequest(req) || isPublicTunnelRequest) && !isAlicePath) return json(res,404,{error:'Не найдено'});
  if (req.method==='GET' && url.pathname==='/') { res.writeHead(200,{'content-type':'text/html; charset=utf-8'}); return res.end(html); }
- if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{configured:!!(envApiKey || config.apiKey),apiKeySource:envApiKey?'environment':'settings',model:config.model,webhook:`http://localhost:${port}/alice`,requests:log.length,tunnel:{running:!!tunnelProcess,url:tunnelUrl,error:tunnelError}});
+ if (req.method==='GET' && url.pathname==='/api/status') return json(res,200,{configured:!!(envApiKey || config.apiKey),apiKeySource:envApiKey?'environment':'settings',model:config.model,systemPrompt:config.systemPrompt,webhook:`http://localhost:${port}/alice`,requests:log.length,tunnel:{running:!!tunnelProcess,url:tunnelUrl,error:tunnelError}});
  if (req.method==='GET' && url.pathname==='/api/log') return json(res,200,log);
  if (req.method==='POST' && url.pathname==='/api/config') { try { const input=await body(req); config={...config,apiKey:envApiKey?config.apiKey:String(input.apiKey ?? config.apiKey).trim(),model:String(input.model || config.model).trim(),systemPrompt:String(input.systemPrompt || config.systemPrompt).slice(0,4000),fallback:String(input.fallback || config.fallback).slice(0,300)}; await writeFile(configFile,JSON.stringify(config,null,2),{mode:0o600}); await chmod(configFile,0o600); return json(res,200,{ok:true,configured:!!(envApiKey || config.apiKey),apiKeySource:envApiKey?'environment':'settings',model:config.model}); } catch(e) { return json(res,400,{error:e.message}); } }
  if (req.method==='POST' && url.pathname==='/api/tunnel/start') {
@@ -88,8 +133,8 @@ const server = http.createServer(async (req,res) => {
   const history=getHistory(input);
   if(!text) { const reply=aliceReply(input,'Привет! Я подключена к Gemini. О чём поговорим?',false,history); Object.assign(entry,{question:'(запуск навыка)',answer:reply.response.text,ok:true}); return json(res,200,reply); }
   entry.question=text;
-  try { const answer=await askGemini(text,history); const nextHistory=storedHistory([...history,{role:'user',text:text.slice(0,MAX_HISTORY_TEXT)},{role:'model',text:answer.slice(0,MAX_HISTORY_TEXT)}]); const reply=aliceReply(input,answer,false,nextHistory); Object.assign(entry,{answer:reply.response.text,ok:true}); return json(res,200,reply); }
-  catch(e) { const timed=e.name==='AbortError'; const answer=timed?config.fallback:`Не удалось обратиться к Gemini: ${e.message}`; Object.assign(entry,{answer,ok:false,error:timed?'Превышено время ожидания Gemini':e.message}); return json(res,200,aliceReply(input,answer,false,history)); }
+  const requestStarted=Date.now(); const requestId=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8); const metrics={requestId,timeMsk:new Date(requestStarted).toLocaleString('sv-SE',{timeZone:'Europe/Moscow',hour12:false}),port,serperRequested:false,serperMs:0,serperResultsProvided:false,serperContextChars:0,geminiMs:0,geminiHttp:null,finishReason:null,outputTokens:null,outcome:'ok'}; try { const responseDeadline=Date.now()+3600; const wantsSearch=isSearchIntent(text)&&Boolean(process.env.SERPER_API_KEY); let searchContext=''; if(wantsSearch){metrics.serperRequested=true; const serperStarted=Date.now(); searchContext=await searchWeb(text,Math.min(1600,Math.max(0,responseDeadline-Date.now()-1900)),metrics); metrics.serperMs=Date.now()-serperStarted; metrics.serperResultsProvided=Boolean(searchContext); metrics.serperContextChars=searchContext.length;} const geminiTimeout=Math.max(100,Math.min(wantsSearch?2200:3000,responseDeadline-Date.now()-250)); const answer=await askGemini(text,history,searchContext,geminiTimeout,metrics); metrics.answerChars=answer.length; const nextHistory=storedHistory([...history,{role:'user',text:text.slice(0,MAX_HISTORY_TEXT)},{role:'model',text:answer.slice(0,MAX_HISTORY_TEXT)}]); const reply=aliceReply(input,answer,false,nextHistory); metrics.replyChars=reply.response.text.length; Object.assign(entry,{answer:reply.response.text,ok:true}); metrics.totalMs=Date.now()-requestStarted; console.info('[request-metrics] '+JSON.stringify(metrics)); return json(res,200,reply); }
+  catch(e) { const timed=e.name==='AbortError'; const answer=timed?config.fallback:`Не удалось обратиться к Gemini: ${e.message}`; Object.assign(entry,{answer,ok:false,error:timed?'Превышено время ожидания Gemini':e.message}); metrics.totalMs=Date.now()-requestStarted; metrics.outcome=timed?'timeout':'error'; console.info('[request-metrics] '+JSON.stringify(metrics)); return json(res,200,aliceReply(input,answer,false,history)); }
  }
  if (req.method==='OPTIONS') { res.writeHead(204,{'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'}); return res.end(); }
  json(res,404,{error:'Не найдено'});

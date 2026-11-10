@@ -9,13 +9,14 @@ services:
     environment:
       VPN_SERVICE_PROVIDER: custom
       VPN_TYPE: wireguard
-      FIREWALL_INPUT_PORTS: "8787"
+      FIREWALL_INPUT_PORTS: "8787,8788"
       FIREWALL_OUTBOUND_SUBNETS: ${DOCKER_SUBNET:-172.30.0.0/24}
       TZ: Europe/Moscow
     volumes:
       - ./wireguard/wg0.conf:/gluetun/wireguard/wg0.conf:ro
     ports:
       - "127.0.0.1:${APP_PORT:-8787}:8787/tcp"
+      - "127.0.0.1:8788:8788/tcp"
     networks:
       - alice_net
     restart: unless-stopped
@@ -33,13 +34,34 @@ services:
       PORT: 8787
       APP_DATA_DIR: /data
       GEMINI_API_KEY: ${GEMINI_API_KEY:?Add GEMINI_API_KEY to .env}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
       ADMIN_TRUSTED_IPS: ${DOCKER_GATEWAY:-172.30.0.1}
     volumes:
       - alice_data:/data
     restart: unless-stopped
+  alice-gemini-sv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alice-gemini-sv
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8788
+      APP_DATA_DIR: /data
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Add GEMINI_API_KEY to .env}
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      ADMIN_TRUSTED_IPS: ${DOCKER_GATEWAY:-172.30.0.1}
+    volumes:
+      - alice_data_sv:/data
+    restart: unless-stopped
 
 volumes:
   alice_data:
+  alice_data_sv:
 
 networks:
   alice_net:

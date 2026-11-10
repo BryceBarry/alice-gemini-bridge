@@ -16,3 +16,9 @@ wireguard/
 *.dmg
 *.app/
 !cloudflare-worker/.dev.vars.example
+
+# Локальные резервные копии — не публиковать
+*.bak*
+*.before-*
+*.tar.gz
+backups/
